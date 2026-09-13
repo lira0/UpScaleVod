@@ -13,77 +13,21 @@ jobs:
     steps:
       - name: Baixar repositório
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Procurar arquivo ZIP
+      - name: Localizar arquivo ZIP
         id: zip
         shell: bash
         run: |
           ZIP_FILE=$(find . -maxdepth 1 -type f -iname "*.zip" | head -n 1)
 
           if [ -z "$ZIP_FILE" ]; then
-            echo "Nenhum arquivo .zip encontrado na raiz."
+            echo "ERRO: nenhum arquivo .zip encontrado na raiz do repositório."
             exit 1
           fi
 
-          echo "ZIP encontrado: $ZIP_FILE"
+          echo "Arquivo encontrado: $ZIP_FILE"
           echo "file=$ZIP_FILE" >> "$GITHUB_OUTPUT"
 
-      - name: Instalar unzip
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y unzip
-
-      - name: Descompactar projeto
-        shell: bash
-        run: |
-          ZIP="${{ steps.zip.outputs.file }}"
-
-          echo "Descompactando $ZIP..."
-
-          mkdir -p extracted
-          unzip -o "$ZIP" -d extracted
-
-          echo "Conteúdo extraído:"
-          find extracted -maxdepth 3 -type f
-
-      - name: Detectar estrutura do ZIP
-        shell: bash
-        run: |
-          shopt -s dotglob nullglob
-
-          ITEMS=(extracted/*)
-
-          # Se houver apenas uma pasta dentro do ZIP,
-          # copia o conteúdo dela para a raiz.
-          if [ "${#ITEMS[@]}" -eq 1 ] && [ -d "${ITEMS[0]}" ]; then
-            echo "ZIP contém uma pasta principal."
-            cp -a "${ITEMS[0]}/." .
-          else
-            echo "ZIP já contém os arquivos na estrutura correta."
-            cp -a extracted/. .
-          fi
-
-      - name: Remover arquivos temporários
-        shell: bash
-        run: |
-          rm -rf extracted
-
-          # Remove o ZIP original depois da instalação
-          rm -f "${{ steps.zip.outputs.file }}"
-
-      - name: Mostrar estrutura final
-        shell: bash
-        run: |
-          echo "================================"
-          echo "ESTRUTURA FINAL DO REPOSITÓRIO"
-          echo "================================"
-
-          find . \
-            -not -path "./.git/*" \
-            -maxdepth 4 \
-            -print
-
-      - name: Fazer commit dos arquivos
-        shell: bash
-        run: |
-          git config user
+      - name: Instalar ferramentas
