@@ -1,0 +1,96 @@
+name: Upscale 1080p - Download manual
+
+on:
+  workflow_dispatch:
+    inputs:
+      queue:
+        description: 'Uma URL por linha, opcionalmente URL | Nome'
+        required: true
+        type: string
+      crf:
+        description: 'Qualidade HEVC (18 melhor/maior, 23 menor/menor)'
+        required: true
+        default: '21'
+        type: choice
+        options: ['18', '20', '21', '23', '25']
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.queue.outputs.matrix }}
+    steps:
+      - id: queue
+        shell: python
+        env:
+          QUEUE: ${{ inputs.queue }}
+        run: |
+          import os, json, re
+          items = []
+          for i, line in enumerate(os.environ['QUEUE'].splitlines(), 1):
+              line = line.strip()
+              if not line: continue
+              url, _, name = line.partition('|')
+              url = url.strip()
+              if not url.startswith(('https://','http://')):
+                  raise SystemExit(f'URL inválida na linha {i}')
+              name = (name.strip() or f'Video_{i:03d}')
+              name = re.sub(r'[^\w .()-]', '_', name, flags=re.UNICODE).strip(' .')[:90] or f'Video_{i:03d}'
+              items.append({'url':url,'name':f'{i:03d}_{name}'})
+          if not items or len(items) > 256:
+              raise SystemExit('A fila deve ter entre 1 e 256 vídeos')
+          with open(os.environ['GITHUB_OUTPUT'],'a') as f:
+              f.write('matrix='+json.dumps({'include':items},ensure_ascii=True)+'\n')
+
+  upscale:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Liberar disco
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h /
+      - name: Instalar ferramentas
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg aria2
+      - name: Baixar vídeo
+        env:
+          VIDEO_URL: ${{ matrix.url }}
+        run: |
+          mkdir -p work
+          aria2c --max-connection-per-server=8 --split=8 --min-split-size=4M --file-allocation=none --dir=work --out=input.video "$VIDEO_URL"
+          ffprobe -v error -show_entries format=duration,size:stream=codec_type,codec_name,width,height -of default=noprint_wrappers=1 work/input.video
+      - name: Upscale e encode único MP4
+        env:
+          CRF: ${{ inputs.crf }}
+        run: |
+          set -euo pipefail
+          ffmpeg -hide_banner -y -i work/input.video \
+            -map 0:v:0 -map 0:a? \
+            -vf "hqdn3d=1.2:1.2:6:6,scale=1920:1080:force_original_aspect_ratio=decrease:flags=lanczos,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,unsharp=5:5:0.35:5:5:0.0" \
+            -c:v libx265 -preset fast -crf "$CRF" -pix_fmt yuv420p10le \
+            -c:a aac -b:a 160k -movflags +faststart \
+            work/output.mp4
+          ffprobe -v error -show_entries format=size,duration -of default=noprint_wrappers=1 work/output.mp4
+      - name: Remover original para liberar disco
+        run: rm -f work/input.video
+      - name: Disponibilizar MP4 para download
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: work/output.mp4
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+      - name: Limpeza
+        if: always()
+        run: rm -rf work
