@@ -1,0 +1,236 @@
+name: MKV para MP4 e envio ao Telegram
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_links:
+        description: 'Links: URL | Nome ;; URL | Nome. Aceita uma URL por linha. Em branco usa secret VIDEO_LINKS.'
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: mkv-telegram-mtproto
+  cancel-in-progress: false
+
+jobs:
+  converter-e-enviar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Preparar Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Instalar FFmpeg, aria2 e Telethon
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2 ffmpeg
+          python -m pip install --disable-pip-version-check --no-cache-dir 'telethon==1.45.0' cryptg hachoir
+
+      - name: Converter e enviar a fila
+        shell: bash
+        env:
+          VIDEO_LINKS_INPUT: ${{ inputs.video_links }}
+          VIDEO_LINKS_SECRET: ${{ secrets.VIDEO_LINKS }}
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python - <<'PYCODE'
+          """Fila MKV -> MP4 sem recodificação -> Telegram MTProto (Telethon)."""
+          import asyncio
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import tempfile
+          import time
+          from pathlib import Path
+          from urllib.parse import unquote, urlsplit
+
+          from telethon import TelegramClient
+          from telethon.sessions import StringSession
+
+          MAX_MP4_BYTES = 1_950_000_000  # Margem abaixo dos 2000 MB.
+          MAX_QUEUE_SECONDS = 5 * 3600 + 10 * 60  # Evita iniciar novos vídeos ao final do job.
+
+
+          def safe_title(value):
+              value = re.sub(r'[\x00-\x1f<>:"/\\|?*]+', '_', value).strip(' .')
+              if value.lower().endswith(('.mkv', '.mp4', '.avi', '.mov', '.ts', '.webm')):
+                  value = value.rsplit('.', 1)[0]
+              return (value.strip(' .') or 'Episodio')[:140]
+
+
+          def read_queue():
+              raw = (os.environ.get('VIDEO_LINKS_INPUT') or '').strip()
+              if not raw:
+                  raw = (os.environ.get('VIDEO_LINKS_SECRET') or '').strip()
+              if not raw:
+                  raise ValueError('Informe links no Run workflow ou configure o secret VIDEO_LINKS.')
+
+              # A interface do GitHub pode oferecer um campo de uma linha só; ;; separa vídeos.
+              raw = re.sub(r'\s*;;\s*', '\n', raw)
+              items = []
+              for line in raw.splitlines():
+                  line = line.strip()
+                  if not line or line.startswith('#'):
+                      continue
+                  url, delimiter, custom_title = line.partition(' | ')
+                  url = url.strip()
+                  parsed = urlsplit(url)
+                  if parsed.scheme.lower() not in ('http', 'https') or not parsed.netloc:
+                      raise ValueError(f'Link inválido na linha {len(items) + 1}. Use uma URL HTTP(S) direta.')
+                  default_title = Path(unquote(parsed.path).rsplit('/', 1)[-1]).stem or f'Episodio_{len(items) + 1:02d}'
+                  title = safe_title(custom_title if delimiter and custom_title.strip() else default_title)
+                  items.append((url, title))
+              if not items:
+                  raise ValueError('Nenhuma URL encontrada na fila.')
+              return items
+
+
+          def execute(command, label):
+              result = subprocess.run(command, text=True, stdout=subprocess.DEVNULL,
+                                      stderr=subprocess.PIPE, check=False)
+              if result.returncode:
+                  tail = (result.stderr or '').strip()[-900:]
+                  raise RuntimeError(f'{label} falhou (código {result.returncode}). {tail}')
+
+
+          def download(url, folder):
+              execute([
+                  'aria2c', '--no-conf=true', '--file-allocation=none',
+                  '--max-connection-per-server=4', '--split=4', '--min-split-size=10M',
+                  '--max-tries=5', '--retry-wait=10', '--connect-timeout=30', '--timeout=90',
+                  '--summary-interval=0', '--console-log-level=warn',
+                  f'--dir={folder}', '--out=origem.mkv', '--', url,
+              ], 'Download')
+              file = folder / 'origem.mkv'
+              if not file.is_file() or file.stat().st_size == 0:
+                  raise RuntimeError('O download não produziu um arquivo válido.')
+              return file
+
+
+          def remux(src, dst):
+              execute([
+                  'ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
+                  '-i', str(src), '-map', '0:v:0', '-map', '0:a?',
+                  '-c', 'copy', '-movflags', '+faststart', str(dst),
+              ], 'MKV para MP4 (sem recodificar)')
+              if not dst.is_file() or dst.stat().st_size == 0:
+                  raise RuntimeError('O MP4 de saída está vazio ou não existe.')
+              if dst.stat().st_size > MAX_MP4_BYTES:
+                  raise RuntimeError(f'MP4 de {dst.stat().st_size / 1e9:.2f} GB: supera o teto de segurança de 1,95 GB.')
+              probe = subprocess.run([
+                  'ffprobe', '-v', 'error', '-show_entries', 'stream=codec_name,codec_type',
+                  '-of', 'json', str(dst),
+              ], capture_output=True, text=True, check=True)
+              streams = json.loads(probe.stdout).get('streams', [])
+              vcodec = next((s['codec_name'] for s in streams if s.get('codec_type') == 'video'), '?')
+              acodecs = [s['codec_name'] for s in streams if s.get('codec_type') == 'audio']
+              print(f'    MP4: {dst.stat().st_size / 1e6:.1f} MB | vídeo={vcodec} | áudio={",".join(acodecs) or "sem áudio"}', flush=True)
+              if vcodec not in ('h264', 'hevc', 'av1') or any(a != 'aac' for a in acodecs):
+                  print('    Aviso: os codecs foram preservados; alguns players podem não reproduzir esse MP4.', flush=True)
+
+
+          def summary(rows):
+              path = os.environ.get('GITHUB_STEP_SUMMARY')
+              if not path:
+                  return
+              with open(path, 'a', encoding='utf-8') as f:
+                  f.write('## MKV → MP4 → Telegram\n\n')
+                  f.write('| Episódio | Resultado |\n|---|---|\n')
+                  for name, state in rows:
+                      name = name.replace('|', '\\|').replace('`', "'")
+                      f.write(f'| {name} | {state} |\n')
+                  f.write('\nArquivos temporários apagados após cada episódio.\n')
+
+
+          async def send(client, target, mp4, title):
+              last_progress = [-10, 0.0]
+
+              def show_progress(uploaded, total):
+                  now = time.monotonic()
+                  percent = int(100 * uploaded / total) if total else 0
+                  if percent >= last_progress[0] + 10 or now - last_progress[1] >= 120:
+                      print(f'    Telegram: {percent}% enviado', flush=True)
+                      last_progress[:] = [percent, now]
+
+              result = await client.send_file(
+                  target, str(mp4), caption=title, force_document=False,
+                  supports_streaming=True, mime_type='video/mp4',
+                  progress_callback=show_progress,
+              )
+              if not getattr(result, 'id', None):
+                  raise RuntimeError('Não foi possível confirmar a mensagem enviada ao Telegram.')
+              return result.id
+
+
+          async def main():
+              required = ['TELEGRAM_API_ID', 'TELEGRAM_API_HASH', 'TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID']
+              missing = [key for key in required if not os.environ.get(key)]
+              if missing:
+                  raise ValueError('Configure estes Secrets no GitHub: ' + ', '.join(missing))
+              queue = read_queue()
+              print(f'Fila iniciada: {len(queue)} vídeo(s).', flush=True)
+              for url, _ in queue:
+                  print(f'::add-mask::{url}', flush=True)
+
+              chat = os.environ['TELEGRAM_CHAT_ID'].strip()
+              recipient = int(chat) if chat.lstrip('-').isdigit() else chat
+              rows = []
+              started_at = time.monotonic()
+              client = TelegramClient(StringSession(), int(os.environ['TELEGRAM_API_ID']),
+                                      os.environ['TELEGRAM_API_HASH'])
+              try:
+                  await client.start(bot_token=os.environ['TELEGRAM_BOT_TOKEN'])
+                  try:
+                      target = await client.get_input_entity(recipient)
+                  except (ValueError, TypeError) as ex:
+                      raise RuntimeError(
+                          'Não foi possível localizar o chat. Confira o CHAT_ID, adicione o bot como '
+                          'administrador do canal ou use o @username de um canal público.'
+                      ) from ex
+
+                  for index, (url, title) in enumerate(queue, 1):
+                      if time.monotonic() - started_at > MAX_QUEUE_SECONDS:
+                          print('Parando a fila antes de alcançar o limite de tempo do GitHub.', flush=True)
+                          rows.extend((remaining_title, '⏸️ Não iniciado: limite de tempo')
+                                      for _, remaining_title in queue[index - 1:])
+                          break
+                      print(f'[{index}/{len(queue)}] {title}', flush=True)
+                      try:
+                          with tempfile.TemporaryDirectory(prefix='remux-', dir=os.environ.get('RUNNER_TEMP')) as dirname:
+                              folder = Path(dirname)
+                              source = download(url, folder)
+                              mp4 = folder / (title + '.mp4')
+                              remux(source, mp4)
+                              message_id = await send(client, target, mp4, title)
+                              print(f'    Enviado com sucesso! message_id={message_id}', flush=True)
+                              rows.append((title, '✅ Enviado'))
+                      except Exception as ex:
+                          # Evita imprimir URLs com credenciais, que podem aparecer em mensagens de erro.
+                          message = str(ex).replace(url, '[URL OCULTA]')
+                          print(f'    ERRO: {message}', flush=True)
+                          rows.append((title, '❌ Falhou'))
+              finally:
+                  await client.disconnect()
+                  summary(rows)
+              ok = sum(state == '✅ Enviado' for _, state in rows)
+              print(f'Concluído: {ok}/{len(queue)} enviados.', flush=True)
+              return 0 if ok == len(queue) else 1
+
+
+          if __name__ == '__main__':
+              try:
+                  sys.exit(asyncio.run(main()))
+              except Exception as exc:
+                  print(f'ERRO FATAL: {exc}', file=sys.stderr)
+                  sys.exit(1)
+          PYCODE
