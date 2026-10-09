@@ -1,0 +1,139 @@
+name: Diagnosticar ID do grupo Telegram
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: mkv-telegram-uploader
+  cancel-in-progress: false
+
+jobs:
+  descobrir-grupo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Instalar Python requests
+        run: python -m pip install --disable-pip-version-check --no-cache-dir requests==2.32.5
+
+      - name: Iniciar Bot API local
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for variable in TELEGRAM_API_ID TELEGRAM_API_HASH TELEGRAM_BOT_TOKEN; do
+            if [ -z "${!variable:-}" ]; then
+              echo "::error::Secret ausente: ${variable}"
+              exit 1
+            fi
+          done
+          # Mesma modalidade de API local do workflow principal.
+          # O logOut da API hospedada pode avisar que o bot ja foi desconectado.
+          python - <<'PY'
+          import os, requests
+          token = os.environ['TELEGRAM_BOT_TOKEN']
+          try:
+              reply = requests.post(f'https://api.telegram.org/bot{token}/logOut', timeout=30)
+              obj = reply.json()
+              if not obj.get('ok'):
+                  print('Observacao logOut:', obj.get('description', 'resposta inesperada'))
+          except (requests.RequestException, ValueError) as exc:
+              print('Aviso: nao foi possivel confirmar logOut da API hospedada:', type(exc).__name__)
+          PY
+          docker run -d --name tg-api --init \
+            -p 127.0.0.1:8081:8081 \
+            -e TELEGRAM_LOCAL=1 \
+            -e TELEGRAM_API_ID="$TELEGRAM_API_ID" \
+            -e TELEGRAM_API_HASH="$TELEGRAM_API_HASH" \
+            aiogram/telegram-bot-api:latest >/dev/null
+          for i in $(seq 1 45); do
+            if curl --silent --max-time 2 http://127.0.0.1:8081/ >/dev/null; then
+              echo 'Servidor Bot API local iniciado.'
+              exit 0
+            fi
+            if [ "$(docker inspect -f '{{.State.Running}}' tg-api)" != true ]; then
+              docker logs --tail 30 tg-api
+              exit 1
+            fi
+            sleep 2
+          done
+          echo '::error::Servidor Bot API local nao respondeu a tempo.'
+          exit 1
+
+      - name: Descobrir chat ID pela mensagem do grupo
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, re, sys, time
+          import requests
+
+          url = 'http://127.0.0.1:8081/bot' + os.environ['TELEGRAM_BOT_TOKEN'] + '/'
+          s = requests.Session()
+
+          def call(method, data=None, timeout=30):
+              r = s.post(url + method, data=data, timeout=timeout)
+              try:
+                  body = r.json()
+              except ValueError:
+                  raise RuntimeError(f'{method}: HTTP {r.status_code} sem JSON')
+              if not body.get('ok'):
+                  raise RuntimeError(f'{method}: {body.get("description", "erro desconhecido")}')
+              return body['result']
+
+          bot = call('getMe')
+          username = bot['username']
+          print('Bot autenticado: @' + username, flush=True)
+          webhook = call('getWebhookInfo')
+          if webhook.get('url'):
+              print('::error::Este bot possui um webhook ativo. Use um bot exclusivo para upload.')
+              sys.exit(1)
+
+          # Confirma updates anteriores para identificar uma mensagem nova do grupo.
+          prior = call('getUpdates', {'timeout': 0, 'limit': 100})
+          offset = max((x['update_id'] for x in prior), default=-1) + 1
+          print('ENVIE AGORA, NO GRUPO DE DESTINO, A MENSAGEM:', flush=True)
+          print('/id@' + username, flush=True)
+          print('Escutando por ate 120 segundos...', flush=True)
+
+          deadline = time.monotonic() + 120
+          while time.monotonic() < deadline:
+              updates = call('getUpdates', {'timeout': 10, 'offset': offset, 'allowed_updates': '["message"]'}, timeout=20)
+              for event in updates:
+                  offset = max(offset, event['update_id'] + 1)
+                  msg = event.get('message') or {}
+                  chat = msg.get('chat') or {}
+                  if chat.get('type') not in ('group', 'supergroup'):
+                      continue
+                  value = (msg.get('text') or '').strip()
+                  match = re.match(r'^/id(?:@([A-Za-z0-9_]+))?(?:\s|$)', value, re.I)
+                  if not match or (match.group(1) and match.group(1).lower() != username.lower()):
+                      continue
+                  if (msg.get('from') or {}).get('is_bot'):
+                      continue
+                  chat_id = chat['id']
+                  chat_title = chat.get('title') or '(sem titulo)'
+                  print('GRUPO CONFIRMADO: ' + chat_title, flush=True)
+                  print('TELEGRAM_CHAT_ID=' + str(chat_id), flush=True)
+                  verified = call('getChat', {'chat_id': str(chat_id)})
+                  print('getChat OK: ' + str(verified['id']), flush=True)
+                  path = os.getenv('GITHUB_STEP_SUMMARY')
+                  if path:
+                      with open(path, 'a', encoding='utf-8') as out:
+                          out.write('## Grupo Telegram confirmado\n\n')
+                          out.write('Nome: **' + chat_title.replace('|', '/') + '**\n\n')
+                          out.write('`TELEGRAM_CHAT_ID=' + str(chat_id) + '`\n')
+                  sys.exit(0)
+
+          print('::error::Nenhum comando /id@' + username + ' recebido. Confira se este e o bot adicionado ao grupo e envie enquanto o job esta executando.')
+          sys.exit(1)
+          PY
+
+      - name: Remover servidor temporario
+        if: always()
+        run: docker rm -f tg-api >/dev/null 2>&1 || true
